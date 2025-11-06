@@ -4,9 +4,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import NetworkError, BadRequest
 import uuid
 import logging
-import asyncio # --- ИЗМЕНЕНО (Цель: Блокировки) ---
-from messages import get_text
+import asyncio
+import os
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -19,1197 +20,1176 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8362338506:AAF0Mesy5rljzRanopp1F5t1jVKmaFfCim4" #токен
-SUPER_ADMIN_IDS = {8405627314, 8424970062} #айдишки админов
+# Конфигурация
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "8464403655:AAGTZPYm8F9hjiLWJVpJJnXgrS2e4ytkMdU")
+SUPER_ADMIN_IDS = {8405627314, 8424970062}
 DEPOSIT_TON_ADDRESS = "UQAcCNRAk9Swq5-P9px5gOW58RRHim4-Ok6vWgYjQI03qTAt"
-ADMIN_CHAT_ID = -5097403821 #айди чата
+ADMIN_CHAT_ID = -5097403821
 WITHDRAWAL_THRESHOLD = {}
-SUCCESSFUL_DEALS_THRESHOLD = 3 #колво сделок для вывода
+SUCCESSFUL_DEALS_THRESHOLD = 3
 user_data = {}
 deals = {}
 ADMIN_ID = set()
 DB_NAME = 'bot_data.db'
 
-# --- ИЗМЕНЕНО (Цель: Блокировки) ---
-lock = asyncio.Lock()
-# --- ИЗМЕНЕНО (КОНЕЦ) ---
-
-# Database initialization
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Adding a table for administrators
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS administrators (
-            user_id INTEGER PRIMARY KEY
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            ton_wallet TEXT,
+            balance_ton REAL DEFAULT 0.0,
+            balance_rub REAL DEFAULT 0.0,
+            balance_stars REAL DEFAULT 0.0,
+            successful_deals INTEGER DEFAULT 0,
+            lang TEXT DEFAULT 'ru',
+            granted_by INTEGER,
+            is_admin INTEGER DEFAULT 0
         )
-    """)
-    # Adding a table for deals
-    cursor.execute("""
+    ''')
+
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [column[1] for column in cursor.fetchall()]
+    for col in ['ton_wallet', 'balance_ton', 'balance_rub', 'balance_stars', 'lang', 'granted_by', 'is_admin']:
+        if col not in columns:
+            col_type = 'TEXT' if col in ['ton_wallet', 'lang'] else 'REAL DEFAULT 0.0' if col.startswith('balance_') else 'INTEGER'
+            cursor.execute(f'ALTER TABLE users ADD COLUMN {col} {col_type}')
+
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS deals (
             deal_id TEXT PRIMARY KEY,
-            seller_id INTEGER NOT NULL,
-            buyer_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            valute TEXT NOT NULL,
+            amount REAL,
             description TEXT,
-            status TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            seller_id INTEGER,
+            buyer_id INTEGER,
+            status TEXT,
+            payment_method TEXT
         )
-    """)
-    # Adding a table for user data
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_data (
-            user_id INTEGER PRIMARY KEY,
-            lang TEXT DEFAULT 'ru',
-            balance_ton REAL DEFAULT 0.0,
-            balance_eth REAL DEFAULT 0.0,
-            wallet_ton TEXT,
-            wallet_eth TEXT,
-            referral_id INTEGER,
-            total_deals_completed INTEGER DEFAULT 0
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS notifications (
+            notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deal_id TEXT,
+            seller_id INTEGER,
+            buyer_id INTEGER,
+            description TEXT,
+            amount REAL,
+            valute TEXT,
+            timestamp TEXT
         )
-    """)
-    # Adding a table for deposits (for admin review)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS deposits (
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            currency TEXT,
+            requisites TEXT,
+            status TEXT,
+            timestamp TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawal_thresholds (
+            user_id INTEGER,
+            currency TEXT,
+            threshold REAL,
+            PRIMARY KEY (user_id, currency)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deal_thresholds (
+            threshold INTEGER DEFAULT 3
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_deposits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            amount REAL NOT NULL,
-            valute TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER,
+            amount REAL,
+            valute TEXT,
+            screenshot_file_id TEXT,
+            timestamp TEXT
         )
-    """)
-    # Adding a table for withdrawals (for admin review)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            amount REAL NOT NULL,
-            valute TEXT NOT NULL,
-            wallet TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Adding a table for referrals
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            referrer_id INTEGER NOT NULL,
-            referred_id INTEGER NOT NULL,
-            PRIMARY KEY (referrer_id, referred_id)
-        )
-    """)
+    ''')
+
+    cursor.execute('SELECT threshold FROM deal_thresholds LIMIT 1')
+    if not cursor.fetchone():
+        cursor.execute('INSERT INTO deal_thresholds (threshold) VALUES (?)', (SUCCESSFUL_DEALS_THRESHOLD,))
     conn.commit()
     conn.close()
 
-# Load data from DB on startup
 def load_data():
-    global user_data, deals, ADMIN_ID
+    global ADMIN_ID, SUCCESSFUL_DEALS_THRESHOLD
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Load administrators
-    cursor.execute("SELECT user_id FROM administrators")
-    ADMIN_ID = {row[0] for row in cursor.fetchall()}
-
-    # Load user data
-    cursor.execute("SELECT user_id, lang, balance_ton, balance_eth, wallet_ton, wallet_eth, referral_id, total_deals_completed FROM user_data") # Изменен SELECT запрос
+    cursor.execute('SELECT user_id, ton_wallet, balance_ton, balance_rub, balance_stars, successful_deals, lang, granted_by, is_admin FROM users')
     for row in cursor.fetchall():
-        user_id, lang, balance_ton, balance_eth, wallet_ton, wallet_eth, referral_id, total_deals_completed = row # Изменена распаковка
+        user_id, ton_wallet, balance_ton, balance_rub, balance_stars, successful_deals, lang, granted_by, is_admin = row
         user_data[user_id] = {
-            'lang': lang,
-            'balance_ton': balance_ton,
-            'balance_eth': balance_eth,
-            'wallet_ton': wallet_ton,
-            'wallet_eth': wallet_eth,
-            'referral_id': referral_id,
-            'total_deals_completed': total_deals_completed,
-            'state': None, # Current state for multi-step operations
-            'temp': {} # Temporary data for current operation
+            'ton_wallet': ton_wallet or '',
+            'balance_ton': balance_ton or 0.0,
+            'balance_rub': balance_rub or 0.0,
+            'balance_stars': balance_stars or 0.0,
+            'successful_deals': successful_deals or 0,
+            'lang': lang or 'ru',
+            'granted_by': granted_by,
+            'is_admin': is_admin or 0
+        }
+        if is_admin:
+            ADMIN_ID.add(user_id)
+
+    for super_admin_id in SUPER_ADMIN_IDS:
+        if super_admin_id not in user_data:
+            user_data[super_admin_id] = {
+                'ton_wallet': '',
+                'balance_ton': 0.0,
+                'balance_rub': 0.0,
+                'balance_stars': 0.0,
+                'successful_deals': 0,
+                'lang': 'ru',
+                'granted_by': None,
+                'is_admin': 1
+            }
+            ADMIN_ID.add(super_admin_id)
+            save_user_data(super_admin_id)
+        elif not user_data[super_admin_id].get('is_admin'):
+            user_data[super_admin_id]['is_admin'] = 1
+            ADMIN_ID.add(super_admin_id)
+            save_user_data(super_admin_id)
+
+    cursor.execute('SELECT deal_id, amount, description, seller_id, buyer_id, status, payment_method FROM deals')
+    for row in cursor.fetchall():
+        deal_id, amount, description, seller_id, buyer_id, status, payment_method = row
+        deals[deal_id] = {
+            'amount': amount or 0.0,
+            'description': description or '',
+            'seller_id': seller_id,
+            'buyer_id': buyer_id,
+            'status': status or 'active',
+            'payment_method': payment_method or 'ton'
         }
 
-    # Load deals (simplified, full details handled by database)
-    # The deal logic is extensive, let's only check for 'star' mentions in columns/logic.
-    # The `valute` column in the `deals` table is generic (`valute TEXT NOT NULL`), so no change there.
+    cursor.execute('SELECT user_id, currency, threshold FROM withdrawal_thresholds')
+    for row in cursor.fetchall():
+        user_id, currency, threshold = row
+        if user_id not in WITHDRAWAL_THRESHOLD:
+            WITHDRAWAL_THRESHOLD[user_id] = {}
+        WITHDRAWAL_THRESHOLD[user_id][currency] = threshold or 0.0
+
+    cursor.execute('SELECT threshold FROM deal_thresholds LIMIT 1')
+    result = cursor.fetchone()
+    if result:
+        SUCCESSFUL_DEALS_THRESHOLD = result[0]
 
     conn.close()
-    logger.info("Data loaded successfully.")
+    logger.info(f"Loaded administrators: {ADMIN_ID}, Successful deals threshold: {SUCCESSFUL_DEALS_THRESHOLD}")
 
-# Save user data to DB
-async def save_user_data(user_id):
-    async with lock: # --- ИЗМЕНЕНО (Цель: Блокировки) ---
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        data = user_data.get(user_id, {})
-        cursor.execute("""
-            INSERT OR REPLACE INTO user_data (user_id, lang, balance_ton, balance_eth, wallet_ton, wallet_eth, referral_id, total_deals_completed) # Изменены столбцы
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            data.get('lang', 'ru'),
-            data.get('balance_ton', 0.0),
-            data.get('balance_eth', 0.0),
-            data.get('wallet_ton'),
-            data.get('wallet_eth'),
-            data.get('referral_id'),
-            data.get('total_deals_completed', 0)
-        ))
-        conn.commit()
-        conn.close()
-
-# Helper function to get user data
-def get_user_data(user_id):
-    if user_id not in user_data:
-        # Load from DB if not in memory (useful for hot reload or new user)
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, lang, balance_ton, balance_eth, wallet_ton, wallet_eth, referral_id, total_deals_completed FROM user_data WHERE user_id=?", (user_id,)) # Изменен SELECT запрос
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            user_id, lang, balance_ton, balance_eth, wallet_ton, wallet_eth, referral_id, total_deals_completed = row # Изменена распаковка
-            user_data[user_id] = {
-                'lang': lang,
-                'balance_ton': balance_ton,
-                'balance_eth': balance_eth,
-                'wallet_ton': wallet_ton,
-                'wallet_eth': wallet_eth,
-                'referral_id': referral_id,
-                'total_deals_completed': total_deals_completed,
-                'state': None,
-                'temp': {}
-            }
-            return user_data[user_id]
-        else:
-            # New user data structure
-            user_data[user_id] = {
-                'lang': 'ru',
-                'balance_ton': 0.0,
-                'balance_eth': 0.0,
-                'wallet_ton': None,
-                'wallet_eth': None,
-                'referral_id': None,
-                'total_deals_completed': 0,
-                'state': None,
-                'temp': {}
-            }
-            return user_data[user_id]
-    return user_data[user_id]
-
-def is_admin(user_id):
-    return user_id in ADMIN_ID or user_id in SUPER_ADMIN_IDS
-
-def get_main_menu_keyboard(lang, user_id):
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'add_wallet_button'), callback_data='add_wallet'),
-            InlineKeyboardButton(get_text(lang, 'create_deal_button'), callback_data='create_deal'),
-        ],
-        [
-            InlineKeyboardButton(get_text(lang, 'deposit_button'), callback_data='deposit'),
-            InlineKeyboardButton(get_text(lang, 'withdraw_button'), callback_data='withdraw'),
-            InlineKeyboardButton(get_text(lang, 'balance_button'), callback_data='balance'),
-        ],
-        [
-            InlineKeyboardButton(get_text(lang, 'referral_button'), callback_data='referral'),
-            InlineKeyboardButton(get_text(lang, 'support_button'), callback_data='support'),
-            InlineKeyboardButton(get_text(lang, 'change_lang_button'), callback_data='change_lang'),
-        ]
-    ]
-    if is_admin(user_id):
-        keyboard.append([InlineKeyboardButton(get_text(lang, 'admin_panel_button'), callback_data='admin_panel')])
-    
-    return InlineKeyboardMarkup(keyboard)
-
-# --- Command handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    referrer_id = None
-
-    # Check for referral link
-    if context.args and len(context.args) == 1:
-        try:
-            potential_referrer_id = int(context.args[0])
-            if potential_referrer_id != user_id:
-                referrer_id = potential_referrer_id
-        except ValueError:
-            pass # Invalid ID
-
-    user_data[user_id] = get_user_data(user_id)
-    lang = user_data[user_id]['lang']
-
-    # Handle referral
-    if referrer_id and user_data[user_id]['referral_id'] is None:
-        user_data[user_id]['referral_id'] = referrer_id
-        
-        # Save to DB
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, user_id))
-        conn.commit()
-        conn.close()
-
-    user_data[user_id]['state'] = None
-    user_data[user_id]['temp'] = {}
-    await save_user_data(user_id)
-
-    reply_markup = get_main_menu_keyboard(lang, user_id)
-    
-    await update.message.reply_text(
-        text=get_text(lang, 'start_message'), 
-        reply_markup=reply_markup, 
-        parse_mode='HTML'
-    )
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user_data[user_id]['state'] = None
-    user_data[user_id]['temp'] = {}
-    await save_user_data(user_id)
-    lang = get_user_data(user_id)['lang']
-
-    reply_markup = get_main_menu_keyboard(lang, user_id)
-    await update.message.reply_text(
-        text=get_text(lang, 'start_message'), 
-        reply_markup=reply_markup, 
-        parse_mode='HTML'
-    )
-
-# --- Main menu callback handler ---
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    lang = get_user_data(user_id)['lang']
-
-    if data == 'menu':
-        user_data[user_id]['state'] = None
-        user_data[user_id]['temp'] = {}
-        await save_user_data(user_id)
-        reply_markup = get_main_menu_keyboard(lang, user_id)
-        await query.edit_message_text(
-            text=get_text(lang, 'start_message'),
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-    elif data == 'deposit':
-        await deposit(query, context)
-    elif data.startswith('deposit_'):
-        await deposit_callback_handler(query, context)
-    
-    elif data == 'add_wallet':
-        await add_wallet(query, context)
-    elif data.startswith('add_wallet_'):
-        await add_wallet_callback_handler(query, context)
-    elif data.startswith('delete_wallet_'):
-        await delete_wallet_callback_handler(query, context)
-
-    elif data == 'withdraw':
-        await withdraw(query, context)
-    elif data.startswith('withdraw_'):
-        await withdraw_callback_handler(query, context)
-        
-    elif data == 'balance':
-        # Refresh balance info (already handled by balance function, just calling it)
-        await balance(query, context)
-
-    elif data == 'referral':
-        await referral(query, context)
-    elif data == 'change_lang':
-        await change_lang(query, context)
-        
-    elif data == 'create_deal':
-        await create_deal_step_1(query, context)
-    elif data.startswith('deal_type_'):
-        await create_deal_step_2(query, context)
-    elif data.startswith('deal_valute_'):
-        await create_deal_step_4(query, context)
-        
-    elif data.startswith('confirm_deal_'):
-        await confirm_deal(query, context)
-    elif data.startswith('reject_deal_'):
-        await reject_deal(query, context)
-    elif data.startswith('seller_sent_'):
-        await seller_sent(query, context)
-    elif data.startswith('buyer_received_'):
-        await buyer_received(query, context)
-    elif data.startswith('dispute_deal_'):
-        await open_dispute(query, context)
-        
-    # --- Admin Handlers ---
-    elif data == 'admin_panel':
-        await admin_menu(query, context)
-    elif data == 'admin_deposit_list':
-        await admin_deposit_list(query, context)
-    elif data.startswith('confirm_deposit_'):
-        await admin_confirm_deposit(query, context)
-    elif data.startswith('reject_deposit_'):
-        await admin_reject_deposit(query, context)
-    elif data == 'admin_withdraw_list':
-        await admin_withdraw_list(query, context)
-    elif data.startswith('confirm_withdraw_'):
-        await admin_confirm_withdraw(query, context)
-    elif data.startswith('reject_withdraw_'):
-        await admin_reject_withdraw(query, context)
-    elif data == 'admin_disputes_list':
-        await admin_disputes_list(query, context)
-    elif data.startswith('admin_resolve_dispute_'):
-        await admin_resolve_dispute_menu(query, context)
-    elif data.startswith('admin_dispute_action_'):
-        await admin_dispute_action(query, context)
-    elif data == 'admin_add_admin':
-        await admin_add_admin_request(query, context)
-    elif data == 'admin_remove_admin':
-        await admin_remove_admin_request(query, context)
-    elif data == 'admin_list_admins':
-        await admin_list_admins(query, context)
-    elif data == 'admin_set_balance':
-        await admin_set_balance_request(query, context)
-    
-    else:
-        await query.edit_message_text(get_text(lang, 'unknown_command_message'))
-
-# --- Deposit Handlers (Updated) ---
-
-async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'deposit_ton_button'), callback_data='deposit_ton'),
-            InlineKeyboardButton(get_text(lang, 'deposit_eth_button'), callback_data='deposit_eth')
-        ],
-        [InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.edit_message_text(get_text(lang, 'deposit_menu_message'), reply_markup=reply_markup)
-
-async def deposit_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    user_data[user_id]['state'] = None # Clear state after action
-    lang = get_user_data(user_id)['lang']
-
-    data = query.data.split('_')
-    currency = data[1]
-
-    if currency == 'ton':
-        message_text = get_text(lang, 'deposit_ton_message', deposit_ton_address=DEPOSIT_TON_ADDRESS)
-    elif currency == 'eth':
-        message_text = get_text(lang, 'deposit_eth_message', deposit_eth_address='N/A') # Placeholder/Not provided
-    else:
-        message_text = get_text(lang, 'error_message')
-
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        text=message_text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-# --- Wallet Handlers (Updated) ---
-
-async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    user_data[user_id]['state'] = None
-
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'add_wallet_ton_button'), callback_data='add_wallet_ton'),
-            InlineKeyboardButton(get_text(lang, 'add_wallet_eth_button'), callback_data='add_wallet_eth'),
-        ],
-        [InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.edit_message_text(get_text(lang, 'select_currency_for_wallet'), reply_markup=reply_markup)
-
-async def add_wallet_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-
-    data = query.data.split('_')
-    currency = data[2]
-
-    user_data[user_id]['temp']['wallet_currency'] = currency
-
-    if currency == 'ton':
-        message_text = get_text(lang, 'enter_ton_wallet_message')
-        user_data[user_id]['state'] = 'awaiting_wallet_ton'
-    elif currency == 'eth':
-        message_text = get_text(lang, 'enter_eth_wallet_message')
-        user_data[user_id]['state'] = 'awaiting_wallet_eth'
-    else:
-        message_text = get_text(lang, 'error_message')
-        user_data[user_id]['state'] = None
-
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        text=message_text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    await save_user_data(user_id)
-
-async def delete_wallet_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-    user_data[user_id]['state'] = None
-
-    data = query.data.split('_')
-    currency = data[2]
-
-    wallet_key = f'wallet_{currency}'
-    user_data[user_id][wallet_key] = None
-
-    await save_user_data(user_id)
-
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        text=get_text(lang, 'wallet_deleted', valute=currency),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def send_wallet_updated_message(user_id, currency, message):
-    lang = get_user_data(user_id)['lang']
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await message.reply_text(
-        text=get_text(lang, 'wallet_updated', valute=currency),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-# --- Message Handler ---
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    current_state = get_user_data(user_id).get('state')
-    
-    # Wallet input handling
-    if current_state == 'awaiting_wallet_ton':
-        wallet = update.message.text.strip()
-        user_data[user_id]['wallet_ton'] = wallet 
-        user_data[user_id]['state'] = None
-        await save_user_data(user_id)
-        await send_wallet_updated_message(user_id, 'ton', update.message)
-    elif current_state == 'awaiting_wallet_eth':
-        wallet = update.message.text.strip()
-        user_data[user_id]['wallet_eth'] = wallet 
-        user_data[user_id]['state'] = None
-        await save_user_data(user_id)
-        await send_wallet_updated_message(user_id, 'eth', update.message)
-    
-    # Deposit amount input handling (for manual deposits if needed, though TON/ETH are external)
-    elif current_state == 'awaiting_deposit_amount':
-        currency = user_data[user_id]['temp'].get('deposit_currency')
-        if not currency:
-            await update.message.reply_text(get_text(lang, 'error_message'))
-            user_data[user_id]['state'] = None
-            return
-
-        try:
-            amount = float(update.message.text.strip())
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(get_text(lang, 'enter_amount_message', valute=currency))
-            return
-
-        # Insert deposit request into DB for admin review
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO deposits (user_id, username, amount, valute, status)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, update.effective_user.username, amount, currency, 'pending')) 
-        deposit_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-
-        # Send notification to admin chat
-        admin_message = get_text(lang, 'admin_deposit_notification_message', 
-                                 username=update.effective_user.username, 
-                                 user_id=user_id, 
-                                 amount=amount, 
-                                 valute=currency)
-        
-        # Create inline keyboard for admin (Confirm/Reject)
-        keyboard = [[
-            InlineKeyboardButton(get_text('ru', 'admin_deposit_confirm_button'), callback_data=f'confirm_deposit_{deposit_id}'),
-            InlineKeyboardButton(get_text('ru', 'admin_deposit_reject_button'), callback_data=f'reject_deposit_{deposit_id}')
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=admin_message,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        
-        # Notify user
-        await update.message.reply_text(get_text(lang, 'deposit_request_sent', amount=amount, valute=currency)) 
-        
-        user_data[user_id]['state'] = None
-        user_data[user_id]['temp'] = {}
-        await save_user_data(user_id)
-
-    # Withdrawal amount input handling
-    elif current_state == 'awaiting_withdraw_amount':
-        currency = user_data[user_id]['temp'].get('withdraw_currency')
-        if not currency:
-            await update.message.reply_text(get_text(lang, 'error_message'))
-            user_data[user_id]['state'] = None
-            return
-
-        try:
-            amount = float(update.message.text.strip())
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(get_text(lang, 'enter_amount_message', valute=currency))
-            return
-
-        # Check balance
-        balance_key = f'balance_{currency}'
-        current_balance = get_user_data(user_id).get(balance_key, 0.0)
-        if amount > current_balance:
-            await update.message.reply_text(f"🚫 Недостаточно средств на балансе. Ваш баланс: {current_balance:.2f} {currency.upper()}")
-            return
-            
-        # Check wallet
-        wallet_key = f'wallet_{currency}'
-        wallet_address = get_user_data(user_id).get(wallet_key)
-        if not wallet_address:
-            await update.message.reply_text(get_text(lang, 'wallet_not_found', valute=currency))
-            return
-
-        # Insert withdrawal request into DB for admin review
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO withdrawals (user_id, username, amount, valute, wallet, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, update.effective_user.username, amount, currency, wallet_address, 'pending')) 
-        withdraw_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-
-        # Deduct from user balance immediately (to prevent double spending)
-        user_data[user_id][balance_key] -= amount
-        await save_user_data(user_id)
-
-        # Send notification to admin chat
-        admin_message = get_text(lang, 'admin_withdraw_notification_message', 
-                                 username=update.effective_user.username, 
-                                 user_id=user_id, 
-                                 amount=amount, 
-                                 valute=currency)
-        
-        # Create inline keyboard for admin (Confirm/Reject)
-        keyboard = [[
-            InlineKeyboardButton(get_text('ru', 'admin_withdraw_confirm_button'), callback_data=f'confirm_withdraw_{withdraw_id}'),
-            InlineKeyboardButton(get_text('ru', 'admin_withdraw_reject_button'), callback_data=f'reject_withdraw_{withdraw_id}')
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"{admin_message}\nКошелек: <code>{wallet_address}</code>",
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        
-        # Notify user
-        await update.message.reply_text(get_text(lang, 'withdraw_request_sent', amount=amount, valute=currency)) 
-        
-        user_data[user_id]['state'] = None
-        user_data[user_id]['temp'] = {}
-        await save_user_data(user_id)
-        
-    # Deal creation steps
-    elif current_state == 'awaiting_deal_partner_id':
-        await handle_deal_partner_id(update, context)
-    elif current_state == 'awaiting_deal_amount':
-        await handle_deal_amount(update, context)
-    elif current_state == 'awaiting_deal_description':
-        await handle_deal_description(update, context)
-
-    # Admin set balance
-    elif current_state == 'awaiting_admin_set_balance':
-        await handle_admin_set_balance_input(update, context)
-    
-    # Admin add/remove
-    elif current_state == 'awaiting_admin_add':
-        await admin_handle_add_admin(update, context)
-    elif current_state == 'awaiting_admin_remove':
-        await admin_handle_remove_admin(update, context)
-
-    # Default handler for unknown messages
-    else:
-        # Check if the message is a valid command but without leading '/' (optional)
-        if update.message.text in [get_text(lang, 'add_wallet_button'), get_text(lang, 'create_deal_button'), get_text(lang, 'deposit_button'), get_text(lang, 'withdraw_button'), get_text(lang, 'balance_button'), get_text(lang, 'referral_button'), get_text(lang, 'change_lang_button')]:
-            return # Ignore if it's a button text sent as a message
-            
-        await update.message.reply_text(get_text(lang, 'unknown_message_error'))
-
-
-# --- Balance Handler (Updated) ---
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    data = get_user_data(user_id)
-
-    # Get balances
-    balance_ton = data.get('balance_ton', 0.0)
-    balance_eth = data.get('balance_eth', 0.0)
-
-    # Prepare message
-    message_text = get_text(lang, 'balance_message', 
-                            balance_ton=f"{balance_ton:.2f}", 
-                            balance_eth=f"{balance_eth:.2f}")
-
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Determine if it's a message or callback query
-    if isinstance(update, Update):
-        await update.message.reply_text(
-            text=message_text, 
-            reply_markup=reply_markup, 
-            parse_mode='HTML'
-        )
-    else: # It's a callback query
-        await update.edit_message_text(
-            text=message_text, 
-            reply_markup=reply_markup, 
-            parse_mode='HTML'
-        )
-
-
-# --- Withdrawal Handlers (Updated) ---
-
-async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    user_data[user_id]['state'] = None
-    
-    # Check minimum deals threshold
-    if get_user_data(user_id).get('total_deals_completed', 0) < SUCCESSFUL_DEALS_THRESHOLD and not is_admin(user_id):
-        await update.edit_message_text(f"🚫 Вывод доступен только после совершения {SUCCESSFUL_DEALS_THRESHOLD} успешных сделок.")
-        return
-    
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'withdraw_ton_button'), callback_data='withdraw_ton'),
-            InlineKeyboardButton(get_text(lang, 'withdraw_eth_button'), callback_data='withdraw_eth'),
-        ],
-        [InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.edit_message_text(get_text(lang, 'select_withdraw_currency'), reply_markup=reply_markup)
-
-async def withdraw_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-    
-    data = query.data.split('_')
-    currency = data[1]
-    
-    user_data[user_id]['temp']['withdraw_currency'] = currency
-    
-    # Check if wallet is set
-    wallet_key = f'wallet_{currency}'
-    if not get_user_data(user_id).get(wallet_key):
-        keyboard = [[
-            InlineKeyboardButton(get_text(lang, 'add_wallet_button'), callback_data=f'add_wallet_{currency}'),
-            InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            text=get_text(lang, 'wallet_not_found', valute=currency),
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        return
-
-    # Check minimum balance (Optional: add a minimum withdrawal amount check here)
-
-    # Set state and prompt for amount
-    valute_display = currency.upper()
-    user_data[user_id]['state'] = 'awaiting_withdraw_amount'
-
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        text=get_text(lang, 'enter_amount_message', valute=valute_display),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    await save_user_data(user_id)
-
-
-# --- Deal Handlers (Updated) ---
-
-async def create_deal_step_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    user_data[user_id]['state'] = 'awaiting_deal_partner_id'
-    user_data[user_id]['temp'] = {}
-    await save_user_data(user_id)
-    
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.edit_message_text(
-        text=get_text(lang, 'create_deal_step_1'),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def handle_deal_partner_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    
-    try:
-        partner_id = int(update.message.text.strip())
-        if partner_id == user_id:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(get_text(lang, 'create_deal_step_1'))
-        return
-
-    user_data[user_id]['temp']['partner_id'] = partner_id
-    user_data[user_id]['state'] = None
-    await save_user_data(user_id)
-    
-    # Go to step 2: Deal type
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'deal_type_buy'), callback_data='deal_type_buy'),
-            InlineKeyboardButton(get_text(lang, 'deal_type_sell'), callback_data='deal_type_sell'),
-        ],
-        [InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message = await update.message.reply_text(
-        text=get_text(lang, 'deal_type_select'),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    user_data[user_id]['temp']['message_id'] = message.message_id
-    await save_user_data(user_id)
-
-
-async def create_deal_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-
-    data = query.data.split('_')
-    deal_type = data[2]
-    user_data[user_id]['temp']['deal_type'] = deal_type
-    
-    # Go to step 3: Amount
-    user_data[user_id]['state'] = 'awaiting_deal_amount'
-    await save_user_data(user_id)
-    
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        text=get_text(lang, 'create_deal_step_2'),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def handle_deal_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    
-    try:
-        amount = float(update.message.text.strip())
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(get_text(lang, 'create_deal_step_2'))
-        return
-
-    user_data[user_id]['temp']['amount'] = amount
-    user_data[user_id]['state'] = None
-    await save_user_data(user_id)
-    
-    # Go to step 3: Currency
-    keyboard = [
-        [
-            InlineKeyboardButton(get_text(lang, 'create_deal_ton_button'), callback_data='deal_valute_ton'),
-            InlineKeyboardButton(get_text(lang, 'create_deal_eth_button'), callback_data='deal_valute_eth'),
-        ],
-        [InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message = await update.message.reply_text(
-        text=get_text(lang, 'create_deal_step_3'),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    user_data[user_id]['temp']['message_id'] = message.message_id
-    await save_user_data(user_id)
-
-async def create_deal_step_4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-
-    data = query.data.split('_')
-    valute = data[2]
-    user_data[user_id]['temp']['valute'] = valute
-    
-    # Go to step 4: Description
-    user_data[user_id]['state'] = 'awaiting_deal_description'
-    await save_user_data(user_id)
-    
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    deal_type = user_data[user_id]['temp']['deal_type']
-    message_key = 'create_deal_step_4_sell' if deal_type == 'sell' else 'create_deal_step_4_buy'
-
-    await query.edit_message_text(
-        text=get_text(lang, message_key),
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    
-async def handle_deal_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = get_user_data(user_id)['lang']
-    
-    description = update.message.text.strip()
-    if not description:
-        await update.message.reply_text(get_text(lang, 'create_deal_step_4_sell')) # Using sell as a generic prompt for text
-        return
-
-    user_data[user_id]['temp']['description'] = description
-    
-    # Finalize deal creation
-    partner_id = user_data[user_id]['temp']['partner_id']
-    deal_type = user_data[user_id]['temp']['deal_type']
-    amount = user_data[user_id]['temp']['amount']
-    valute = user_data[user_id]['temp']['valute']
-
-    seller_id = user_id if deal_type == 'sell' else partner_id
-    buyer_id = partner_id if deal_type == 'sell' else user_id
-    
-    deal_id = str(uuid.uuid4()).split('-')[0] # Short unique ID
-
+def save_user_data(user_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO deals (deal_id, seller_id, buyer_id, amount, valute, description, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (deal_id, seller_id, buyer_id, amount, valute, description, 'pending'))
+    user = user_data.get(user_id, {})
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (
+            user_id, ton_wallet, balance_ton, balance_rub, balance_stars,
+            successful_deals, lang, granted_by, is_admin
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        user_id,
+        user.get('ton_wallet', ''),
+        user.get('balance_ton', 0.0),
+        user.get('balance_rub', 0.0),
+        user.get('balance_stars', 0.0),
+        user.get('successful_deals', 0),
+        user.get('lang', 'ru'),
+        user.get('granted_by'),
+        user.get('is_admin', 0)
+    ))
     conn.commit()
     conn.close()
 
-    seller_username = update.effective_user.username or seller_id
-    
+def save_deal(deal_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    deal = deals.get(deal_id, {})
+    cursor.execute('''
+        INSERT OR REPLACE INTO deals (
+            deal_id, amount, description, seller_id, buyer_id, status, payment_method
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        deal_id,
+        deal.get('amount', 0.0),
+        deal.get('description', ''),
+        deal.get('seller_id'),
+        deal.get('buyer_id'),
+        deal.get('status', 'active'),
+        deal.get('payment_method', 'ton')
+    ))
+    conn.commit()
+    conn.close()
+
+def save_notification(deal_id, seller_id, buyer_id, description, amount, valute):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO notifications (
+            deal_id, seller_id, buyer_id, description, amount, valute, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    ''', (deal_id, seller_id, buyer_id, description, amount, valute))
+    conn.commit()
+    conn.close()
+
+def save_withdrawal_request(user_id, amount, currency, requisites):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO withdrawal_requests (
+            user_id, amount, currency, requisites, status, timestamp
+        ) VALUES (?, ?, ?, ?, 'pending', datetime('now'))
+    ''', (user_id, amount, currency, requisites))
+    request_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return request_id
+
+def save_withdrawal_threshold(user_id, currency, threshold):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO withdrawal_thresholds (user_id, currency, threshold)
+        VALUES (?, ?, ?)
+    ''', (user_id, currency, threshold))
+    conn.commit()
+    conn.close()
+
+def save_deal_threshold(threshold):
+    global SUCCESSFUL_DEALS_THRESHOLD
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE deal_thresholds SET threshold = ?', (threshold,))
+    if cursor.rowcount == 0:
+        cursor.execute('INSERT INTO deal_thresholds (threshold) VALUES (?)', (threshold,))
+    conn.commit()
+    conn.close()
+    SUCCESSFUL_DEALS_THRESHOLD = threshold
+
+def ensure_user_exists(user_id):
+    if user_id not in user_data:
+        user_data[user_id] = {
+            'ton_wallet': '',
+            'balance_ton': 0.0,
+            'balance_rub': 0.0,
+            'balance_stars': 0.0,
+            'successful_deals': 0,
+            'lang': 'ru',
+            'granted_by': None,
+            'is_admin': 1 if user_id in SUPER_ADMIN_IDS else 0
+        }
+        if user_id in SUPER_ADMIN_IDS:
+            ADMIN_ID.add(user_id)
+        save_user_data(user_id)
+
+async def _display_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, lang: str, message_id: int = None):
     try:
-        buyer_user = await context.bot.get_chat(buyer_id)
-        buyer_username = buyer_user.username or buyer_id
-    except BadRequest:
-        buyer_username = f"Неизвестный пользователь ({buyer_id})"
-
-    # Clear state
-    user_data[user_id]['state'] = None
-    user_data[user_id]['temp'] = {}
-    await save_user_data(user_id)
+        from messages import get_text
+    except ImportError:
+        # Fallback если messages.py не загружен
+        def get_text(lang, key, **kwargs):
+            texts = {
+                'ru': {
+                    "create_deal_button": "📝 Создать сделку",
+                    "add_wallet_button": "💰 Добавить кошелёк",
+                    "balance_button": "📈 Баланс",
+                    "referral_button": "🤝 Рефералка",
+                    "change_lang_button": "🌍 Язык",
+                    "support_button": "💬 Поддержка",
+                    "start_message": "Добро пожаловать в бота!",
+                    "menu_button": "🏠 В главное меню"
+                },
+                'en': {
+                    "create_deal_button": "📝 Create Deal",
+                    "add_wallet_button": "💰 Add Wallet",
+                    "balance_button": "📈 Balance",
+                    "referral_button": "🤝 Referral",
+                    "change_lang_button": "🌍 Language",
+                    "support_button": "💬 Support",
+                    "start_message": "Welcome to the bot!",
+                    "menu_button": "🏠 Main Menu"
+                }
+            }
+            return texts.get(lang, texts['ru']).get(key, key)
     
-    # Notify initial creator (current user)
-    await update.message.reply_text(
-        text=get_text(lang, 'deal_created_message', 
-                      deal_id=deal_id, 
-                      seller_username=seller_username, 
-                      seller_id=seller_id,
-                      buyer_username=buyer_username, 
-                      buyer_id=buyer_id,
-                      amount=f"{amount:.2f}", 
-                      valute=valute, 
-                      description=description),
-        parse_mode='HTML'
-    )
-    
-    # Notify partner (if possible)
-    try:
-        keyboard = get_deal_action_keyboard(deal_id, 'pending', user_id, buyer_id, lang)
-        
-        await context.bot.send_message(
-            chat_id=partner_id,
-            text=get_text(lang, 'deal_created_message', 
-                          deal_id=deal_id, 
-                          seller_username=seller_username, 
-                          seller_id=seller_id,
-                          buyer_username=buyer_username, 
-                          buyer_id=buyer_id,
-                          amount=f"{amount:.2f}", 
-                          valute=valute, 
-                          description=description),
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-    except BadRequest as e:
-        logger.error(f"Could not send deal notification to partner {partner_id}: {e}")
-        
-    await cancel(update, context) # Return to main menu
+    keyboard = [
+        [InlineKeyboardButton(get_text(lang, "create_deal_button"), callback_data='create_deal')],
+        [InlineKeyboardButton(get_text(lang, "add_wallet_button"), callback_data='wallet_menu')],
+        [InlineKeyboardButton(get_text(lang, "balance_button"), callback_data='view_balance')],
+        [InlineKeyboardButton(get_text(lang, "referral_button"), callback_data='referral')],
+        [InlineKeyboardButton(get_text(lang, "change_lang_button"), callback_data='change_lang')],
+        [InlineKeyboardButton(get_text(lang, "support_button"), callback_data='support')],
+    ]
+    if user_id in ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("🔧 Админка", callback_data='admin_panel')])
 
-
-# ... (Functions for deal actions: get_deal_action_keyboard, get_deal_details, confirm_deal, etc.)
-# Note: The logic inside these functions assumes the `valute` is 'ton' or 'eth' and handles the balance accordingly.
-# Since 'star' logic was simple balance deduction/addition, its removal from all related functions is complete.
-
-# --- Admin Handlers (Updated) ---
-
-# --- Admin set balance logic ---
-
-async def admin_set_balance_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update
-    await query.answer()
-    user_id = query.from_user.id
-    lang = get_user_data(user_id)['lang']
-
-    if not is_admin(user_id):
-        await query.edit_message_text(get_text(lang, 'not_admin'))
-        return
-
-    user_data[user_id]['state'] = 'awaiting_admin_set_balance'
-    await save_user_data(user_id)
-    
-    keyboard = [[InlineKeyboardButton(get_text(lang, 'menu_button'), callback_data='menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    caption = get_text(lang, "start_message")
+    photo_url = "https://postimg.cc/4mDVrwJY"
 
-    await query.edit_message_text(
-        text="Введите ID пользователя, валюту (ton/eth) и сумму через пробел.\nПример: 123456789 ton 100.00",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
+    try:
+        if message_id:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id,
+                photo=photo_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+    except BadRequest as e:
+        logger.warning(f"Failed to edit message caption: {e}")
+        await context.bot.send_photo(
+            chat_id,
+            photo=photo_url,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    ensure_user_exists(user_id)
+    lang = user_data[user_id]['lang']
+    args = context.args
+
+    try:
+        if args and args[0] in deals:
+            deal_id = args[0]
+            deal = deals.get(deal_id)
+            if not deal:
+                logger.warning(f"Deal {deal_id} not found in deals")
+                await context.bot.send_message(
+                    chat_id,
+                    f"Сделка #{deal_id} не найдена.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                return
+
+            seller_id = deal['seller_id']
+            logger.info(f"Processing deal {deal_id} for user {user_id}")
+
+            try:
+                seller_chat = await context.bot.get_chat(seller_id)
+                seller_username = seller_chat.username or "Не указан"
+            except Exception as e:
+                logger.error(f"Could not get chat for seller_id {seller_id}: {e}")
+                seller_username = "Не указан"
+
+            deals[deal_id]['buyer_id'] = user_id
+            deals[deal_id]['status'] = 'active'
+            save_deal(deal_id)
+
+            payment_method = deal.get('payment_method', 'ton')
+            if payment_method == 'ton':
+                payment_details = DEPOSIT_TON_ADDRESS
+            elif payment_method == 'stars':
+                payment_details = f"/pay @{context.bot.username} {deal['amount']}"
+            else:
+                payment_details = "Не указано"
+
+            memo = f"Deal #{deal_id}"
+
+            # Упрощенное сообщение о сделке
+            deal_message = f"""
+💳 Информация о сделке #{deal_id}
+👤 Вы покупатель в сделке.
+📌 Продавец: @{seller_username}
+• Успешные сделки: {user_data.get(seller_id, {}).get('successful_deals', 0)}
+• Вы покупаете: {deal['description']}
+🏦 Адрес для оплаты: <code>{payment_details}</code>
+💰 Сумма к оплате: {deal['amount']} {payment_method.upper()}
+📝 Комментарий к платежу: <code>{deal_id}</code>
+⚠️ Убедитесь в правильности данных перед оплатой!
+            """
+
+            await context.bot.send_message(
+                chat_id,
+                deal_message,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 Оплатить с баланса", callback_data=f'pay_from_balance_{deal_id}')],
+                    [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+                ])
+            )
+
+            try:
+                buyer_chat = await context.bot.get_chat(user_id)
+                buyer_username = buyer_chat.username or "Не указан"
+            except Exception as e:
+                logger.error(f"Could not get chat for buyer_id {user_id}: {e}")
+                buyer_username = "Не указан"
+
+            await context.bot.send_message(
+                seller_id,
+                f"🔔 Новый покупатель для сделки #{deal_id}!\nПокупатель: @{buyer_username} ({user_data.get(user_id, {}).get('successful_deals', 0)} успешных сделок)",
+                parse_mode="HTML"
+            )
+
+            try:
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"📝 Новая сделка #{deal_id}\n\nПродавец: @{seller_username} (ID: {seller_id})\nПокупатель: @{buyer_username} (ID: {user_id})\nОписание: {deal['description']}\nСумма: {deal['amount']} {payment_method.upper()}",
+                    parse_mode="HTML"
+                )
+                save_notification(deal_id, seller_id, user_id, deal['description'], deal['amount'], payment_method.upper())
+            except Exception as e:
+                logger.error(f"Failed to send new deal notification to admin chat {ADMIN_CHAT_ID}: {e}")
+        else:
+            await _display_main_menu(update, context, chat_id, user_id, lang)
+    except (NetworkError, BadRequest) as e:
+        logger.error(f"Telegram API error in start: {e}", exc_info=True)
+        await context.bot.send_message(chat_id, "🚫 Ошибка сети. Попробуйте снова.", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error in start: {e}", exc_info=True)
+        await context.bot.send_message(chat_id, "🚫 Произошла ошибка. Попробуйте снова.", parse_mode="HTML")
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        logger.warning("No callback query or message")
+        if query:
+            await query.answer()
+        return
+
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    data = query.data
+    lang = user_data.get(user_id, {}).get('lang', 'ru')
+
+    try:
+        await query.answer()
+        logger.info(f"Callback received: {data} from user {user_id}")
+
+        ensure_user_exists(user_id)
+
+        if data == 'menu':
+            context.user_data.clear()
+            await _display_main_menu(update, context, chat_id, user_id, lang, query.message.message_id)
+            return
+
+        elif data == 'wallet_menu':
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить TON-кошелек", callback_data='add_ton_wallet')],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="Выберите тип кошелька для добавления:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data == 'add_ton_wallet':
+            current_wallet = user_data.get(user_id, {}).get('ton_wallet') or "Не указан"
+            await query.edit_message_caption(
+                caption=f"💳 Ваш текущий TON-кошелек: <code>{current_wallet}</code>\n\nВведите новый адрес TON-кошелька или вернитесь в меню:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            context.user_data['awaiting_ton_wallet'] = True
+
+        elif data == 'create_deal':
+            if not user_data[user_id].get('ton_wallet'):
+                await query.edit_message_caption(
+                    caption="🚫 У вас не указаны реквизиты для получения платежей. Пожалуйста, добавьте кошелек.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💰 Добавить кошелёк", callback_data='wallet_menu')],
+                        [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+                    ])
+                )
+                return
+            keyboard = [
+                [InlineKeyboardButton("💎 TON/USDT", callback_data='payment_method_ton')],
+                [InlineKeyboardButton("🌟 Звезды", callback_data='payment_method_stars')],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="💰 Выберите метод получения оплаты:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data.startswith('payment_method_'):
+            payment_method = data.split('_')[-1]
+            context.user_data['payment_method'] = payment_method
+            valute = "TON" if payment_method == "ton" else "XTR"
+            await query.edit_message_caption(
+                caption=f"Введите сумму сделки в {valute}:\n\nПример: <code>1.5</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            context.user_data['awaiting_amount'] = True
+
+        elif data.startswith('pay_from_balance_'):
+            deal_id = data.split('_')[-1]
+            deal = deals.get(deal_id)
+            if not deal:
+                logger.warning(f"Deal {deal_id} not found in deals")
+                await query.message.reply_text(
+                    f"Сделка #{deal_id} не найдена.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                return
+
+            payment_method = deal.get('payment_method', 'ton')
+            amount = deal['amount']
+            buyer_id = user_id
+            
+            if payment_method == 'ton':
+                balance = user_data.get(buyer_id, {}).get('balance_ton', 0.0)
+            elif payment_method == 'stars':
+                balance = user_data.get(buyer_id, {}).get('balance_stars', 0.0)
+            else:
+                balance = 0.0
+
+            logger.info(f"Processing payment for deal {deal_id}, method: {payment_method}, amount: {amount}, buyer: {buyer_id}")
+
+            if balance < amount:
+                await query.message.reply_text(
+                    f"🚫 Недостаточно средств на балансе. Требуется: {amount} {payment_method.upper()}, доступно: {balance} {payment_method.upper()}.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                return
+
+            if payment_method == 'ton':
+                user_data[buyer_id]['balance_ton'] -= amount
+            elif payment_method == 'stars':
+                user_data[buyer_id]['balance_stars'] -= amount
+            save_user_data(buyer_id)
+
+            deals[deal_id]['status'] = 'confirmed'
+            save_deal(deal_id)
+
+            await query.message.reply_text(
+                f"✅ Оплата по сделке #{deal_id} на сумму {amount} {payment_method.upper()} успешно выполнена!",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+
+            seller_id = deal['seller_id']
+            try:
+                seller_chat = await context.bot.get_chat(seller_id)
+                seller_username = seller_chat.username or "Не указан"
+            except Exception as e:
+                logger.error(f"Could not get chat for seller_id {seller_id}: {e}")
+                seller_username = "Не указан"
+            
+            await context.bot.send_message(
+                seller_id,
+                f"✅ Оплата подтверждена для сделки #{deal_id}\n\n📜 Описание: {deal['description']}\n👤 Отправьте подарок покупателю — @Ether_Weave\n\n⚠️ Отправляйте подарок только указанному пользователю.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Подтвердить отправку", callback_data=f'seller_confirm_sent_{deal_id}')],
+                    [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+                ])
+            )
+
+            try:
+                buyer_chat = await context.bot.get_chat(buyer_id)
+                buyer_username = buyer_chat.username or "Не указан"
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"Оплата по сделке #{deal_id} подтверждена.\nПродавец: @{seller_username}\nПокупатель: @{buyer_username}\nСумма: {amount} {payment_method.upper()}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send payment confirmation to admin chat {ADMIN_CHAT_ID}: {e}")
+
+        elif data == 'deposit_balance':
+            keyboard = [
+                [InlineKeyboardButton("TON/USDT", callback_data="deposit_currency_ton")],
+                [InlineKeyboardButton("Звезды", callback_data="deposit_currency_stars")],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="Выберите валюту для пополнения:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data.startswith('deposit_currency_'):
+            valute = data.split('_')[-1]
+            context.user_data['current_deposit_valute'] = valute
+            if valute == 'ton':
+                await query.edit_message_caption(
+                    caption=f"Введите сумму пополнения в TON:\n\nАдрес для пополнения:\n<code>{DEPOSIT_TON_ADDRESS}</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+            elif valute == 'stars':
+                await query.edit_message_caption(
+                    caption="Введите сумму пополнения в XTR:\n\nСледуйте инструкциям для пополнения через Telegram Stars.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+            context.user_data['awaiting_deposit_amount'] = True
+
+        elif data.startswith('withdraw_currency_'):
+            valute = data.split('_')[-1]
+            context.user_data['current_withdraw_valute'] = valute
+            await query.edit_message_caption(
+                caption=f"Введите сумму для вывода в {valute.upper()}:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            context.user_data['awaiting_withdraw_amount'] = True
+
+        elif data == 'withdraw_balance':
+            keyboard = [
+                [InlineKeyboardButton("TON/USDT", callback_data="withdraw_currency_ton")],
+                [InlineKeyboardButton("Звезды", callback_data="withdraw_currency_stars")],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="Выберите валюту для вывода:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data == 'view_balance':
+            try:
+                ton_balance = user_data.get(user_id, {}).get('balance_ton', 0.0)
+                stars_balance = user_data.get(user_id, {}).get('balance_stars', 0.0)
+                keyboard = [
+                    [InlineKeyboardButton("📥 Пополнить баланс", callback_data='deposit_balance')],
+                    [InlineKeyboardButton("📤 Вывести баланс", callback_data='withdraw_balance')],
+                    [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+                ]
+                caption = f"💰 Ваш баланс:\nТон: {ton_balance}\nРубли: 0\nЗвезды: {stars_balance}"
+                await query.edit_message_caption(
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except BadRequest as e:
+                logger.warning(f"Failed to edit message caption: {e}")
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo="https://postimg.cc/4mDVrwJY",
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logger.error(f"Error displaying balance for user {user_id}: {e}")
+                await query.edit_message_caption(
+                    caption="🚫 Ошибка при отображении баланса.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+
+        elif data == 'referral':
+            bot_info = await context.bot.get_me()
+            referral_link = f"https://t.me/{bot_info.username}?start={user_id}"
+            await query.edit_message_caption(
+                caption=f"🤝 Ваша реферальная ссылка:\n{referral_link}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+
+        elif data == 'change_lang':
+            keyboard = [
+                [InlineKeyboardButton("Русский", callback_data="set_lang_ru")],
+                [InlineKeyboardButton("English", callback_data="set_lang_en")],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="Выберите язык:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data.startswith('set_lang_'):
+            new_lang = data.split('_')[-1]
+            user_data[user_id]['lang'] = new_lang
+            save_user_data(user_id)
+            await query.edit_message_caption(
+                caption="✅ Язык изменен.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+
+        elif data == 'support':
+            await query.edit_message_caption(
+                caption="💬 Напишите ваше сообщение для тех-поддержки:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            context.user_data['awaiting_support_message'] = True
+
+        elif data == 'admin_panel' and user_id in ADMIN_ID:
+            keyboard = [
+                [InlineKeyboardButton("📋 Просмотр сделок", callback_data='admin_view_deals_1')],
+                [InlineKeyboardButton("💰 Изменить баланс", callback_data='admin_change_balance')],
+                [InlineKeyboardButton("👑 Изменить успешные сделки", callback_data='admin_change_successful_deals')],
+                [InlineKeyboardButton("🛡️ Управление админами", callback_data='admin_manage_admins')],
+                [InlineKeyboardButton("⚙️ Установить порог вывода", callback_data='admin_set_threshold')],
+                [InlineKeyboardButton("👑 Установить порог сделок", callback_data='admin_set_deal_threshold')],
+                [InlineKeyboardButton("📜 Список админов", callback_data='admin_list')],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]
+            ]
+            await query.edit_message_caption(
+                caption="⚙️ Админ-панель:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif data.startswith('seller_confirm_sent_'):
+            deal_id = data.split('_')[-1]
+            deal = deals.get(deal_id)
+            if not deal or deal['seller_id'] != user_id:
+                await query.message.reply_text(
+                    f"Сделка #{deal_id} не найдена.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                return
+
+            if deal['status'] == 'sent':
+                await query.answer("Вы уже подтвердили отправку подарка!", show_alert=True)
+                return
+
+            deals[deal_id]['status'] = 'sent'
+            save_deal(deal_id)
+
+            try:
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f'🔔 Продавец @{(await context.bot.get_chat(user_id)).username or "Не указан"} подтвердил отправку подарка по сделке #{deal_id}.\nПокупатель ID: {deal["buyer_id"]}\nСумма: {deal["amount"]} {deal["payment_method"].upper()}\n\nПожалуйста, подтвердите получение подарка @Ether_Weave',
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Подтвердить получение подарка", callback_data=f'admin_confirm_gift_{deal_id}')],
+                        [InlineKeyboardButton("❌ Отклонить сделку", callback_data=f'admin_cancel_deal_{deal_id}')]
+                    ])
+                )
+                
+                await query.message.reply_text(
+                    f"✅ Вы подтвердили отправку по сделке #{deal_id}. Ожидайте подтверждения получения от покупателя.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                
+                await query.edit_message_reply_markup(reply_markup=None)
+                
+            except Exception as e:
+                logger.error(f"Error processing seller confirmation for deal {deal_id}: {e}")
+
+        elif data.startswith('admin_confirm_gift_'):
+            deal_id = data.split('_')[-1]
+            deal = deals.get(deal_id)
+            if not deal:
+                await query.message.reply_text(
+                    f"Сделка #{deal_id} не найдена.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                return
+
+            deals[deal_id]['status'] = 'completed'
+            seller_id = deal['seller_id']
+            
+            if deal["payment_method"] == 'ton':
+                user_data[seller_id]['balance_ton'] += deal['amount']
+            elif deal["payment_method"] == 'stars':
+                user_data[seller_id]['balance_stars'] += deal['amount']
+                
+            user_data[seller_id]['successful_deals'] += 1
+            user_data[deal['buyer_id']]['successful_deals'] += 1
+            save_user_data(seller_id)
+            save_user_data(deal['buyer_id'])
+            save_deal(deal_id)
+
+            try:
+                await context.bot.send_message(
+                    seller_id,
+                    f"✅ Сделка #{deal_id} завершена. Спасибо за сотрудничество!",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                
+                await context.bot.send_message(
+                    deal['buyer_id'],
+                    f"✅ Сделка #{deal_id} завершена. Спасибо за покупку!",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                
+                await query.message.reply_text(
+                    f"✅ Сделка #{deal_id} завершена! Подарок получен.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                
+                await query.edit_message_reply_markup(reply_markup=None)
+                
+            except Exception as e:
+                logger.error(f"Error processing admin gift confirmation for deal {deal_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error in handle_callback_query: {e}", exc_info=True)
+        await query.message.reply_text(
+            "🚫 Произошла ошибка. Попробуйте снова.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+        )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    text = update.message.text if update.message.text else ""
+    lang = user_data.get(user_id, {}).get('lang', 'ru')
+
+    ensure_user_exists(user_id)
+
+    try:
+        if context.user_data.get('awaiting_ton_wallet'):
+            user_data[user_id]['ton_wallet'] = text.strip()
+            save_user_data(user_id)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ TON-кошелек успешно обновлен: <code>{text.strip()}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+
+        elif context.user_data.get('awaiting_amount'):
+            try:
+                amount = float(text.strip())
+                if amount <= 0:
+                    raise ValueError("Amount must be positive")
+                context.user_data['deal_amount'] = amount
+                context.user_data['awaiting_amount'] = False
+                context.user_data['awaiting_description'] = True
+                await update.message.reply_text(
+                    "Введите описание сделки:\n\nПример: <code>Кепочка и Мила</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+            except ValueError:
+                await update.message.reply_text(
+                    "🚫 Сумма должна быть числом больше 0, а также не содержать буквенные символы, только цифры.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+
+        elif context.user_data.get('awaiting_description'):
+            description = text.strip()
+            amount = context.user_data.get('deal_amount')
+            payment_method = context.user_data.get('payment_method', 'ton')
+            deal_id = str(uuid.uuid4())[:8]
+            deals[deal_id] = {
+                'amount': amount,
+                'description': description,
+                'seller_id': user_id,
+                'buyer_id': None,
+                'status': 'active',
+                'payment_method': payment_method
+            }
+            save_deal(deal_id)
+            context.user_data.clear()
+
+            bot_info = await context.bot.get_me()
+            deal_link = f"https://t.me/{bot_info.username}?start={deal_id}"
+            await update.message.reply_text(
+                f"✅ Сделка создана!\n\nСумма: {amount} {payment_method.upper()}\nОписание: {description}\n\nСсылка на сделку: {deal_link}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+
+        elif context.user_data.get('awaiting_deposit_amount'):
+            try:
+                amount = float(text.strip())
+                if amount <= 0:
+                    raise ValueError("Amount must be positive")
+                valute = context.user_data.get('current_deposit_valute', 'ton')
+                
+                await update.message.reply_text(
+                    "📸 Пожалуйста, отправьте скриншот перевода.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                context.user_data['awaiting_deposit_screenshot'] = True
+                context.user_data['deposit_amount'] = amount
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "🚫 Сумма пополнения должна быть числом больше 0.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+
+        elif context.user_data.get('awaiting_withdraw_amount'):
+            try:
+                amount = float(text.strip())
+                if amount <= 0:
+                    raise ValueError("Amount must be positive")
+                valute = context.user_data.get('current_withdraw_valute', 'ton')
+                
+                # Проверка баланса
+                if valute == 'ton':
+                    balance = user_data.get(user_id, {}).get('balance_ton', 0.0)
+                else:
+                    balance = user_data.get(user_id, {}).get('balance_stars', 0.0)
+                    
+                if balance < amount:
+                    await update.message.reply_text(
+                        f"🚫 Недостаточно средств на балансе. Доступно: {balance} {valute.upper()}",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                    )
+                    return
+                    
+                # Проверка успешных сделок
+                if user_data[user_id]['successful_deals'] < SUCCESSFUL_DEALS_THRESHOLD:
+                    await update.message.reply_text(
+                        f"🚫 Для вывода необходимо минимум {SUCCESSFUL_DEALS_THRESHOLD} успешных сделок. У вас {user_data[user_id]['successful_deals']} сделок.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                    )
+                    return
+                
+                context.user_data['withdraw_amount'] = amount
+                context.user_data['awaiting_withdraw_amount'] = False
+                context.user_data['awaiting_withdraw_requisites'] = True
+                
+                requisite_type = "TON-кошелек" if valute == 'ton' else "реквизиты для Stars"
+                await update.message.reply_text(
+                    f"Введите {requisite_type} для вывода:",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "🚫 Сумма вывода должна быть числом больше 0.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+                )
+
+        elif context.user_data.get('awaiting_withdraw_requisites'):
+            requisites = text.strip()
+            amount = context.user_data.get('withdraw_amount')
+            valute = context.user_data.get('current_withdraw_valute', 'ton')
+            
+            # Создаем запрос на вывод
+            request_id = save_withdrawal_request(user_id, amount, valute, requisites)
+            
+            # Списываем средства
+            if valute == 'ton':
+                user_data[user_id]['balance_ton'] -= amount
+            else:
+                user_data[user_id]['balance_stars'] -= amount
+            save_user_data(user_id)
+            
+            context.user_data.clear()
+            
+            await update.message.reply_text(
+                "✅ Запрос на вывод отправлен на проверку администратору.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            
+            # Уведомление админу
+            try:
+                user_chat = await context.bot.get_chat(user_id)
+                username = user_chat.username or "Не указан"
+                full_name = user_chat.full_name or "Не указан"
+                
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"💸 Новый запрос на вывод\n\nПользователь: @{username} ({full_name}, ID: {user_id})\nСумма: {amount} {valute}\nРеквизиты: <code>{requisites}</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Подтвердить", callback_data=f'admin_confirm_withdraw_{request_id}')],
+                        [InlineKeyboardButton("🚫 Отклонить", callback_data=f'admin_reject_withdraw_{request_id}')]
+                    ])
+                )
+            except Exception as e:
+                logger.error(f"Failed to send withdrawal notification to admin: {e}")
+
+        elif context.user_data.get('awaiting_support_message'):
+            message = text.strip()
+            context.user_data.clear()
+            
+            await update.message.reply_text(
+                "✅ Ваше сообщение отправлено в тех-поддержку.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
+            
+            # Пересылаем сообщение админу
+            try:
+                user_chat = await context.bot.get_chat(user_id)
+                username = user_chat.username or "Не указан"
+                full_name = user_chat.full_name or "Не указан"
+                
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"💬 Новое сообщение от пользователя!\n\nПользователь: @{username} ({full_name}, ID: {user_id})\nСообщение: {message}",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📞 Ответить пользователю", callback_data=f'admin_reply_{user_id}')]
+                    ])
+                )
+            except Exception as e:
+                logger.error(f"Failed to send support message to admin: {e}")
+
+    except Exception as e:
+        logger.error(f"Error in handle_message: {e}", exc_info=True)
+        await update.message.reply_text(
+            "🚫 Произошла ошибка. Попробуйте снова.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+        )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('awaiting_deposit_screenshot'):
+        user_id = update.effective_user.id
+        photo = update.message.photo[-1]
+        amount = context.user_data.get('deposit_amount')
+        valute = context.user_data.get('current_deposit_valute', 'ton')
+        
+        context.user_data.clear()
+        
+        await update.message.reply_text(
+            "✅ Скриншот получен и отправлен на проверку. Ожидайте подтверждения.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+        )
+        
+        # Уведомление админу
+        try:
+            user_chat = await context.bot.get_chat(user_id)
+            username = user_chat.username or "Не указан"
+            full_name = user_chat.full_name or "Не указан"
+            
+            await context.bot.send_photo(
+                ADMIN_CHAT_ID,
+                photo=photo.file_id,
+                caption=f"📸 Новый запрос на пополнение\n\nПользователь: @{username} ({full_name}, ID: {user_id})\nСумма: {amount} {valute}\n\nПожалуйста, проверьте скриншот транзакции.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Подтвердить", callback_data=f'admin_confirm_deposit_{user_id}_{amount}_{valute}')],
+                    [InlineKeyboardButton("🚫 Отклонить", callback_data=f'admin_reject_deposit_{user_id}')]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Failed to send deposit notification to admin: {e}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Действие отменено.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
     )
 
-async def handle_admin_set_balance_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_id = update.effective_user.id
-    lang = get_user_data(admin_id)['lang']
-    user_data[admin_id]['state'] = None
-    await save_user_data(admin_id)
-
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    
     try:
-        parts = update.message.text.strip().split()
-        if len(parts) != 3:
-            raise IndexError("Invalid number of arguments.")
-
-        target_user_id = int(parts[0])
-        currency = parts[1].lower()
-        amount = float(parts[2])
-        
-        if currency not in ['ton', 'eth']:
-            await update.message.reply_text("Ошибка: Неверная валюта. Используйте **ton** или **eth**.")
-            return
-
-        balance_key = f'balance_{currency}'
-        
-        # Ensure user exists in memory/DB
-        get_user_data(target_user_id) 
-
-        # Update balance
-        user_data[target_user_id][balance_key] = amount
-        await save_user_data(target_user_id)
-        
-        await update.message.reply_text(f"✅ Баланс пользователя **{target_user_id}** ({currency.upper()}) установлен на **{amount:.2f}**.")
-
-    except (IndexError, ValueError) as e:
-        logger.error(f"Error in handle_admin_set_balance_input: {e}", exc_info=True)
-        await update.message.reply_text("🚫 Ошибка: Некорректный ввод.\nИспользование: `ID_пользователя ton|eth сумма`")
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "🚫 Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+            )
     except Exception as e:
-        logger.error(f"Error in handle_admin_set_balance_input: {e}", exc_info=True)
-        await update.message.reply_text("🚫 Произошла ошибка при обновлении баланса.")
+        logger.error(f"Error in error handler: {e}")
 
-
-# ... (rest of the admin functions: admin_menu, admin_deposit_list, admin_confirm_deposit, etc.)
-# These functions were already updated in the previous turn and are included here for completeness.
-
-# --- НОВЫЕ КОМАНДЫ (НАЧАЛО) ---
-
-# Placeholder command handlers that require context.args
-async def tetherteam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Команда /tetherteam: Информация о команде.")
-
-async def set_deals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_id = update.effective_user.id
-    if not is_admin(admin_id):
-        await update.message.reply_text(get_text(get_user_data(admin_id)['lang'], 'not_admin'))
+# Команды для админов
+async def tetherteam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_ID:
         return
+    
+    await update.message.reply_text(
+        "Команда TetherTeam активирована",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+    )
 
-    try:
-        target_user_id = int(context.args[0])
-        amount = int(context.args[1])
-        
-        get_user_data(target_user_id)
-        user_data[target_user_id]['total_deals_completed'] = amount
-        await save_user_data(target_user_id)
-        
-        await update.message.reply_text(f"Количество завершенных сделок для пользователя **{target_user_id}** было изменено на **{amount}**.")
-
-    except (IndexError, ValueError):
-        await update.message.reply_text("Ошибка: Введите корректный ID и число.\nИспользование: `/deals ID_пользователя количество`")
-    except Exception as e:
-        logger.error(f"Error in set_deals: {e}", exc_info=True)
-        await update.message.reply_text("Произошла ошибка при обновлении сделок.")
-
-
-# Legacy command for setting balance (kept for compatibility, though admin_set_balance_request is the preferred method)
-async def set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_id = update.effective_user.id
-    if not is_admin(admin_id):
-        await update.message.reply_text(get_text(get_user_data(admin_id)['lang'], 'not_admin'))
+async def set_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_ID:
         return
+    
+    await update.message.reply_text(
+        "Управление сделками",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+    )
 
-    try:
-        target_user_id = int(context.args[0])
-        currency = context.args[1].lower()
-        amount = float(context.args[2])
-        
-        if currency not in ['ton', 'eth']:
-            await update.message.reply_text("Ошибка: Неверная валюта. Используйте **ton** или **eth**.")
-            return
-
-        balance_key = f'balance_{currency}'
-        
-        get_user_data(target_user_id) # Load user data
-
-        user_data[target_user_id][balance_key] = amount
-        await save_user_data(target_user_id)
-        
-        await update.message.reply_text(f"Баланс пользователя **{target_user_id}** ({currency.upper()}) был изменен на **{amount:.2f}** ✅")
-
-    except (IndexError, ValueError) as e:
-        logger.error(f"Error in set_balance: {e}", exc_info=True)
-        await update.message.reply_text("Ошибка: Введите корректный ID, валюту (ton/eth) и сумму.\nИспользование: `/balance ID_пользователя ton|eth сумма`")
-    except Exception as e:
-        logger.error(f"Error in set_balance: {e}", exc_info=True)
-        await update.message.reply_text("Произошла ошибка при обновлении баланса.")
-
-# --- НОВЫЕ КОМАНДЫ (КОНЕЦ) ---
-
+async def set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_ID:
+        return
+    
+    await update.message.reply_text(
+        "Управление балансом",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data='menu')]])
+    )
 
 def main():
+    # Инициализация базы данных и загрузка данных
     init_db()
     load_data()
+    
+    # Создание приложения
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Добавление обработчиков
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
-
-    # --- ДОБАВЛЕННЫЕ ХЕНДЛЕРЫ ---
     app.add_handler(CommandHandler("tetherteam", tetherteam))
     app.add_handler(CommandHandler("deals", set_deals))
     app.add_handler(CommandHandler("balance", set_balance))
-    # --- КОНЕЦ ДОБАВЛЕННЫХ ХЕНДЛЕРОВ ---
 
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.DOCUMENT | filters.STICKER, handle_media_message))
-    
-    # Run the bot
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_error_handler(error_handler)
+
     logger.info("Starting bot...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Запуск бота
+    try:
+        # Для веб-хостингов
+        port = int(os.environ.get('PORT', 8080))
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=f"https://your-app-name.railway.app/{BOT_TOKEN}"
+        )
+    except:
+        # Для локального запуска
+        app.run_polling()
 
 if __name__ == '__main__':
-    # Add all necessary functions here to satisfy the imports/calls
-    # ... (Add all missing functions here, e.g., get_deal_action_keyboard, admin_menu, etc.)
-    
-    # Placeholder for missing functions (assuming they exist in the full original file)
-    async def get_deal_action_keyboard(deal_id, status, user_id, buyer_id, lang):
-        return InlineKeyboardMarkup([[]])
-    async def get_deal_details(deal_id, lang, user_id):
-        return ""
-    async def confirm_deal(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def reject_deal(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def seller_sent(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def buyer_received(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def open_dispute(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def referral(query, context):
-        await query.edit_message_text(get_text(get_user_data(query.from_user.id)['lang'], 'ref_link_message', ref_link=f"t.me/{context.bot.username}?start={query.from_user.id}"))
-    async def change_lang(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_menu(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_deposit_list(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_confirm_deposit(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_reject_deposit(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_withdraw_list(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_confirm_withdraw(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_reject_withdraw(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_disputes_list(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_resolve_dispute_menu(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_dispute_action(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_add_admin_request(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_remove_admin_request(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_list_admins(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_set_balance_request(query, context):
-        await query.answer("Действие временно недоступно.")
-    async def admin_handle_add_admin(update, context):
-        await update.message.reply_text("Действие временно недоступно.")
-    async def admin_handle_remove_admin(update, context):
-        await update.message.reply_text("Действие временно недоступно.")
-    async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        lang = get_user_data(user_id)['lang']
-        await update.message.reply_text(get_text(lang, 'unknown_message_error'))
-        
     main()
