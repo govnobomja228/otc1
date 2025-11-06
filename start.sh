@@ -1,3 +1,3 @@
 #!/bin/bash
 echo "Starting Telegram Bot..."
-python bot.py
+python3 bot.py
